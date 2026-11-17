@@ -1,0 +1,1351 @@
+hdglow/
+  db/schema.sql
+  services/identity/app.py          # face detect + embedding similarity
+  apps/api/src/
+    config.ts  modes.ts  analyze.ts  router.ts
+    store.ts   providers/replicate.ts  identity.ts
+    qc.ts      pipeline.ts  queue.ts  quota.ts
+    retention.ts  routes.ts  server.ts
+  apps/web/src/ api.ts  Compare.tsx
+  tests/ qc.test.ts  router.test.ts
+DATABASE_URL=postgres://...
+REDIS_URL=redis://...
+S3_BUCKET=hdglow-private
+S3_REGION=eu-west-1
+REPLICATE_API_TOKEN=            # server only, never shipped to the client
+REPLICATE_VERSIONS={"esrgan":"<hash>","swinir":"<hash>","gfpgan":"<hash>","codeformer":"<hash>","nafnet":"<hash>","oldphoto":"<hash>"}
+PRICE_PER_SECOND={"esrgan":0.0,"swinir":0.0}   # fill from Replicate's published pricing
+AUTH_JWKS_URL=https://your-auth-provider/.well-known/jwks.json
+AUTH_ISSUER=https://your-auth-provider/
+IDENTITY_URL=http://identity:8000
+RETENTION_HOURS=72
+FREE_DAILY_CREDITS=5
+PREMIUM_DAILY_CREDITS=100
+create table users (
+  id text primary key,
+  plan text not null default 'free' check (plan in ('free','premium')),
+  stripe_customer_id text,
+  created_at timestamptz not null default now()
+);
+
+create table consents (
+  user_id text not null references users(id) on delete cascade,
+  kind text not null check (kind in ('upload_processing','training')),
+  policy_version text not null,
+  granted boolean not null,
+  at timestamptz not null default now()
+);
+
+create table usage_daily (
+  user_id text not null references users(id) on delete cascade,
+  day date not null,
+  used int not null default 0,
+  primary key (user_id, day)
+);
+
+create table jobs (
+  id uuid primary key default gen_random_uuid(),
+  user_id text not null references users(id) on delete cascade,
+  idempotency_key text not null,
+  mode text not null,
+  intensity int not null check (intensity between 0 and 100),
+  face_restore boolean not null,
+  face_strength int not null check (face_strength between 0 and 100),
+  export_format text not null check (export_format in ('png','jpeg')),
+  status text not null check (status in
+    ('awaiting_upload','queued','analyzing','enhancing','face_restoring',
+     'checking','succeeded','failed','deleted')),
+  progress int not null default 0,
+  original_key text, original_bytes bigint, original_w int, original_h int, original_sha256 text,
+  output_key text, output_bytes bigint, output_w int, output_h int, output_sha256 text,
+  output_label text,
+  plan jsonb, qc jsonb,
+  error_code text, error_message text,
+  attempts int not null default 0,
+  credits_charged int not null default 0,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  expires_at timestamptz not null,
+  unique (user_id, idempotency_key)
+);
+create index jobs_user_idx on jobs(user_id, created_at desc);
+create index jobs_expiry_idx on jobs(expires_at) where status <> 'deleted';
+
+create table provider_calls (
+  id bigserial primary key,
+  job_id uuid references jobs(id) on delete set null,
+  model text not null, seconds numeric, est_cost_usd numeric,
+  ok boolean not null, at timestamptz not null default now()
+);
+// apps/api/src/config.ts
+import { z } from 'zod';
+
+const json = <T>() => z.string().transform((s) => JSON.parse(s) as T);
+
+const Env = z.object({
+  DATABASE_URL: z.string(),
+  REDIS_URL: z.string(),
+  S3_BUCKET: z.string(),
+  S3_REGION: z.string(),
+  S3_ENDPOINT: z.string().optional(),
+  REPLICATE_API_TOKEN: z.string().min(10),
+  REPLICATE_VERSIONS: json<Record<string, string>>(),
+  PRICE_PER_SECOND: json<Record<string, number>>().default('{}' as any),
+  AUTH_JWKS_URL: z.string().url(),
+  AUTH_ISSUER: z.string(),
+  IDENTITY_URL: z.string().url().optional(),
+  WEB_ORIGIN: z.string().default('http://localhost:5173'),
+  RETENTION_HOURS: z.coerce.number().default(72),
+  MAX_UPLOAD_BYTES: z.coerce.number().default(25 * 1024 * 1024),
+  MAX_PIXELS: z.coerce.number().default(50_000_000),
+  MAX_AI_INPUT_EDGE: z.coerce.number().default(2048),
+  FREE_DAILY_CREDITS: z.coerce.number().default(5),
+  PREMIUM_DAILY_CREDITS: z.coerce.number().default(100),
+  FREE_MAX_OUTPUT_EDGE: z.coerce.number().default(2048),
+  PREMIUM_MAX_OUTPUT_EDGE: z.coerce.number().default(7680),
+  WORKER_CONCURRENCY: z.coerce.number().default(2),
+});
+
+export const cfg = Env.parse(process.env);
+// apps/api/src/modes.ts
+export type ModeId =
+  | 'natural_hd' | 'ultra_hd' | 'upscale_4k' | 'face_restore' | 'blur_remover'
+  | 'noise_cleaner' | 'old_photo' | 'social' | 'original';
+
+export interface ModeSpec {
+  id: ModeId;
+  label: string;
+  tier: 'free' | 'premium';
+  credits: number;
+  defaultIntensity: number;
+  /** Fidelity for CodeFormer: 1 = most faithful to input, 0 = most "restored". */
+  faceFidelity: number;
+  /** Per-mode colour-shift tolerance for QC (0-255 scale). */
+  colorTolerance: number;
+  /** Max allowed sharpness growth vs. a plain Lanczos resize. */
+  maxSharpnessRatio: number;
+  /** Min allowed sharpness vs. baseline (denoise modes legitimately lose some). */
+  minSharpnessRatio: number;
+}
+
+export const MODES: Record<ModeId, ModeSpec> = {
+  natural_hd:   { id: 'natural_hd',   label: 'Natural HD',      tier: 'free',    credits: 1, defaultIntensity: 70,  faceFidelity: 0.9,  colorTolerance: 12, maxSharpnessRatio: 6,  minSharpnessRatio: 0.9 },
+  ultra_hd:     { id: 'ultra_hd',     label: 'Ultra HD',        tier: 'premium', credits: 2, defaultIntensity: 100, faceFidelity: 0.85, colorTolerance: 12, maxSharpnessRatio: 9,  minSharpnessRatio: 0.9 },
+  upscale_4k:   { id: 'upscale_4k',   label: '4K Upscale',      tier: 'premium', credits: 3, defaultIntensity: 100, faceFidelity: 0.85, colorTolerance: 12, maxSharpnessRatio: 9,  minSharpnessRatio: 0.9 },
+  face_restore: { id: 'face_restore', label: 'Face Restore',    tier: 'premium', credits: 2, defaultIntensity: 80,  faceFidelity: 0.9,  colorTolerance: 12, maxSharpnessRatio: 7,  minSharpnessRatio: 0.9 },
+  blur_remover: { id: 'blur_remover', label: 'Blur Remover',    tier: 'premium', credits: 2, defaultIntensity: 80,  faceFidelity: 0.9,  colorTolerance: 12, maxSharpnessRatio: 8,  minSharpnessRatio: 0.9 },
+  noise_cleaner:{ id: 'noise_cleaner',label: 'Noise Cleaner',   tier: 'premium', credits: 1, defaultIntensity: 80,  faceFidelity: 0.95, colorTolerance: 12, maxSharpnessRatio: 3,  minSharpnessRatio: 0.35 },
+  old_photo:    { id: 'old_photo',    label: 'Old Photo Restore',tier: 'premium',credits: 3, defaultIntensity: 90,  faceFidelity: 0.9,  colorTolerance: 45, maxSharpnessRatio: 8,  minSharpnessRatio: 0.5 },
+  social:       { id: 'social',       label: 'Social Media Ready',tier: 'premium',credits: 1, defaultIntensity: 60,  faceFidelity: 0.95, colorTolerance: 12, maxSharpnessRatio: 5,  minSharpnessRatio: 0.9 },
+  original:     { id: 'original',     label: 'Original Quality',tier: 'free',    credits: 1, defaultIntensity: 50,  faceFidelity: 0.95, colorTolerance: 8,  maxSharpnessRatio: 3,  minSharpnessRatio: 0.9 },
+};
+// apps/api/src/analyze.ts
+import sharp from 'sharp';
+import { identity } from './identity.js';
+
+export interface FaceBox { x: number; y: number; w: number; h: number; score: number }
+
+export interface Analysis {
+  width: number; height: number; long: number;
+  sharpness: number;      // Laplacian variance on a 512px proxy
+  noiseSigma: number;     // Immerkaer estimate on the proxy, 0-255 scale
+  meanLuma: number;
+  contrastSpan: number;   // p99 - p1 of luminance
+  bytesPerPixel: number;  // low values suggest heavy compression
+  faces: FaceBox[];
+  faceDetectorAvailable: boolean;
+}
+
+/** Decode any supported input to an auto-oriented sRGB PNG working copy. */
+export async function toWorkPng(input: Buffer): Promise<Buffer> {
+  try {
+    return await sharp(input, { limitInputPixels: 60_000_000 }).rotate().png().toBuffer();
+  } catch (err) {
+    const brand = input.subarray(4, 12).toString('ascii');
+    if (/ftyp(heic|heix|mif1|hevc)/.test(brand)) {
+      // Prebuilt sharp lacks HEVC decoding, so fall back to a JS/WASM decoder.
+      const { default: convert } = await import('heic-convert');
+      const jpeg = Buffer.from(await convert({ buffer: input, format: 'JPEG', quality: 1 }));
+      return sharp(jpeg).rotate().png().toBuffer();
+    }
+    throw err;
+  }
+}
+
+export function lapVar(g: Uint8Array, w: number, h: number): number {
+  let s = 0, s2 = 0, n = 0;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const v = -4 * g[i] + g[i - 1] + g[i + 1] + g[i - w] + g[i + w];
+      s += v; s2 += v * v; n++;
+    }
+  }
+  const m = s / n;
+  return s2 / n - m * m;
+}
+
+function noiseSigma(g: Uint8Array, w: number, h: number): number {
+  let sum = 0;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const v =
+        g[i - w - 1] - 2 * g[i - w] + g[i - w + 1] -
+        2 * g[i - 1] + 4 * g[i] - 2 * g[i + 1] +
+        g[i + w - 1] - 2 * g[i + w] + g[i + w + 1];
+      sum += Math.abs(v);
+    }
+  }
+  return (sum * Math.sqrt(0.5 * Math.PI)) / (6 * (w - 2) * (h - 2));
+}
+
+export async function analyze(work: Buffer, originalBytes: number): Promise<Analysis> {
+  const meta = await sharp(work).metadata();
+  const width = meta.width!, height = meta.height!;
+  const { data, info } = await sharp(work)
+    .resize({ width: 512, height: 512, fit: 'inside', withoutEnlargement: true })
+    .greyscale().raw().toBuffer({ resolveWithObject: true });
+
+  const hist = new Uint32Array(256);
+  let sum = 0;
+  for (const v of data) { hist[v]++; sum += v; }
+  const pct = (p: number) => {
+    let acc = 0; const target = data.length * p;
+    for (let i = 0; i < 256; i++) { acc += hist[i]; if (acc >= target) return i; }
+    return 255;
+  };
+
+  const det = await identity.detect(work);
+  return {
+    width, height, long: Math.max(width, height),
+    sharpness: lapVar(data, info.width, info.height),
+    noiseSigma: noiseSigma(data, info.width, info.height),
+    meanLuma: sum / data.length,
+    contrastSpan: pct(0.99) - pct(0.01),
+    bytesPerPixel: originalBytes / (width * height),
+    faces: det.faces,
+    faceDetectorAvailable: det.available,
+  };
+}
+// apps/api/src/router.ts
+import { cfg } from './config.js';
+import type { Analysis } from './analyze.js';
+import { MODES, type ModeId } from './modes.js';
+
+export type Step =
+  | { kind: 'oldphoto' }
+  | { kind: 'deblur' }
+  | { kind: 'jpeg'; quality: number }
+  | { kind: 'denoise'; level: 15 | 25 | 50 }
+  | { kind: 'sr'; scale: 2 | 4 };
+
+export interface Plan {
+  mode: ModeId;
+  steps: Step[];
+  target: { w: number; h: number };
+  faces: 'off' | 'crop' | 'whole-image-fallback';
+  faceFidelity: number;
+  localOps: { autoLevels: boolean; gamma?: number; sharpen?: number };
+  reasons: string[];       // shown to the user: why we did what we did
+  safer: boolean;
+}
+
+const noiseLevel = (s: number): 15 | 25 | 50 | null =>
+  s < 8 ? null : s < 18 ? 15 : s < 35 ? 25 : 50;
+
+export function buildPlan(
+  modeId: ModeId, a: Analysis,
+  opts: { tier: 'free' | 'premium'; faceRestore: boolean },
+): Plan {
+  const m = MODES[modeId];
+  const reasons: string[] = [];
+  const steps: Step[] = [];
+  const tooLarge = a.long > cfg.MAX_AI_INPUT_EDGE;
+
+  // ----- scale choice
+  let scale: 1 | 2 | 4 = 1;
+  if (tooLarge) {
+    reasons.push(`This photo is already ${a.long}px on its long edge, so AI upscaling was skipped to keep the original detail.`);
+  } else {
+    switch (modeId) {
+      case 'natural_hd': case 'blur_remover': case 'old_photo': scale = 2; break;
+      case 'ultra_hd': scale = 4; break;
+      case 'upscale_4k': scale = a.long * 2 >= 3840 ? 2 : 4; break;
+      case 'face_restore': case 'original': scale = a.long < 1024 ? 2 : 1; break;
+      case 'social': scale = a.long < 1080 ? 2 : 1; break;
+      case 'noise_cleaner': scale = 1; break;
+    }
+  }
+
+  // ----- restoration steps, ordered: repair -> deblur -> artifacts -> noise -> upscale
+  const faded = a.contrastSpan < 150;
+  if (modeId === 'old_photo' && !tooLarge) {
+    steps.push({ kind: 'oldphoto' });
+    reasons.push('Scratch and dust repair applied for the old-photo mode.');
+  }
+  if (modeId === 'blur_remover' && !tooLarge) {
+    if (a.sharpness < 120) { steps.push({ kind: 'deblur' }); reasons.push('Photo measured as soft, so a dedicated deblur model runs before upscaling.'); }
+    else reasons.push('Photo is already fairly sharp, so deblurring was skipped.');
+  }
+  const heavyCompression = a.bytesPerPixel < 0.6;
+  if (!tooLarge && (heavyCompression || modeId === 'noise_cleaner' && a.bytesPerPixel < 1.2)) {
+    steps.push({ kind: 'jpeg', quality: heavyCompression ? 20 : 40 });
+    reasons.push('Compression artifacts detected, so JPEG artifact reduction was added.');
+  }
+  const nl = noiseLevel(a.noiseSigma) ?? (modeId === 'noise_cleaner' ? 15 : null);
+  if (!tooLarge && nl && modeId !== 'original') {
+    steps.push({ kind: 'denoise', level: nl });
+    reasons.push(`Noise level measured (sigma≈${a.noiseSigma.toFixed(1)}), so denoise strength ${nl} was chosen.`);
+  }
+  if (scale > 1) steps.push({ kind: 'sr', scale: scale as 2 | 4 });
+
+  // ----- target dimensions
+  const tierCap = opts.tier === 'premium' ? cfg.PREMIUM_MAX_OUTPUT_EDGE : cfg.FREE_MAX_OUTPUT_EDGE;
+  let longTarget = a.long * scale;
+  if (scale > 1) {
+    longTarget = Math.min(longTarget, tierCap);
+    if (modeId === 'upscale_4k') longTarget = Math.min(longTarget, 3840);
+    if (modeId === 'social') longTarget = Math.min(longTarget, 1440);
+  }
+  const f = longTarget / a.long;
+  const target = { w: Math.max(1, Math.round(a.width * f)), h: Math.max(1, Math.round(a.height * f)) };
+  if (modeId === 'upscale_4k' && Math.max(target.w, target.h) < 3840) {
+    reasons.push(`The source is too small to reach a true 4K long edge in one pass. The output will be ${target.w}×${target.h} and labelled with its real size.`);
+  }
+
+  // ----- faces
+  let faces: Plan['faces'] = 'off';
+  const wantsFaces = opts.faceRestore && !tooLarge;
+  if (wantsFaces && a.faceDetectorAvailable && a.faces.length > 0) {
+    faces = 'crop';
+    reasons.push(`${a.faces.length} face(s) found. Each is restored separately and kept only if it still matches the original person.`);
+  } else if (wantsFaces && modeId === 'face_restore' && !a.faceDetectorAvailable) {
+    faces = 'whole-image-fallback';
+    reasons.push('Face detector unavailable. Conservative whole-image face restoration used and the identity check could not run.');
+  } else if (opts.faceRestore && a.faceDetectorAvailable && a.faces.length === 0) {
+    reasons.push('No faces detected, so face restoration was skipped.');
+  } else if (opts.faceRestore && !a.faceDetectorAvailable) {
+    reasons.push('Face restoration skipped because the identity check is unavailable.');
+  }
+
+  // ----- local, non-generative ops
+  const dark = a.meanLuma < 70;
+  const localOps = {
+    autoLevels: (modeId === 'old_photo' && faded) || (modeId === 'social' && faded),
+    gamma: dark && modeId !== 'original' ? Math.min(2.0, Math.max(1.1, Math.log(0.4) / Math.log(Math.max(a.meanLuma, 20) / 255))) : undefined,
+    sharpen: modeId === 'blur_remover' ? 0.6 : undefined,
+  };
+  if (localOps.gamma) reasons.push('Photo is dark, so exposure was lifted with a gentle gamma curve.');
+  if (localOps.autoLevels) reasons.push('Low contrast detected, so levels were stretched.');
+
+  return { mode: modeId, steps, target, faces, faceFidelity: m.faceFidelity, localOps, reasons, safer: false };
+}
+
+/** Retry ladder: drop face restoration and generative extras, then fall back to the most conservative plan. */
+export function saferPlan(p: Plan, level: 1 | 2, a: Analysis, tier: 'free' | 'premium'): Plan {
+  if (level === 1) {
+    return {
+      ...p, faces: 'off', safer: true,
+      steps: p.steps.filter((s) => s.kind === 'sr' || s.kind === 'denoise'),
+      localOps: { ...p.localOps, sharpen: undefined },
+      reasons: [...p.reasons, 'First attempt failed our quality checks, so a safer configuration was used (face restoration off).'],
+    };
+  }
+  const orig = buildPlan('original', a, { tier, faceRestore: false });
+  return { ...orig, reasons: [...p.reasons, 'Fell back to the most conservative enhancement.'], safer: true };
+}
+// apps/api/src/store.ts
+import {
+  S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand,
+  DeleteObjectsCommand, ListObjectsV2Command,
+} from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
+import { cfg } from './config.js';
+
+const s3 = new S3Client({ region: cfg.S3_REGION, endpoint: cfg.S3_ENDPOINT, forcePathStyle: !!cfg.S3_ENDPOINT });
+const Bucket = cfg.S3_BUCKET;
+
+export const keys = {
+  prefix: (u: string, j: string) => `u/${u}/${j}/`,
+  original: (u: string, j: string) => `u/${u}/${j}/original`,
+  work: (u: string, j: string, n: string) => `u/${u}/${j}/work/${n}.png`,
+  output: (u: string, j: string, ext: string) => `u/${u}/${j}/output.${ext}`,
+};
+
+export const presignUpload = (Key: string, maxBytes: number, contentType: string) =>
+  createPresignedPost(s3, {
+    Bucket, Key, Expires: 600,
+    Conditions: [['content-length-range', 1, maxBytes], ['eq', '$Content-Type', contentType]],
+    Fields: { 'Content-Type': contentType },
+  });
+
+export const presignGet = (Key: string, ttl = 300, filename?: string) =>
+  getSignedUrl(s3, new GetObjectCommand({
+    Bucket, Key,
+    ResponseContentDisposition: filename ? `attachment; filename="${filename}"` : undefined,
+  }), { expiresIn: ttl });
+
+export async function getBuffer(Key: string): Promise<Buffer> {
+  const r = await s3.send(new GetObjectCommand({ Bucket, Key }));
+  return Buffer.from(await r.Body!.transformToByteArray());
+}
+export const putBuffer = (Key: string, Body: Buffer, ContentType: string) =>
+  s3.send(new PutObjectCommand({ Bucket, Key, Body, ContentType, ServerSideEncryption: 'AES256' }));
+
+export async function headSize(Key: string): Promise<number | null> {
+  try { return (await s3.send(new HeadObjectCommand({ Bucket, Key }))).ContentLength ?? null; }
+  catch { return null; }
+}
+
+export async function deletePrefix(Prefix: string): Promise<void> {
+  let token: string | undefined;
+  do {
+    const l = await s3.send(new ListObjectsV2Command({ Bucket, Prefix, ContinuationToken: token }));
+    const objs = (l.Contents ?? []).map((o) => ({ Key: o.Key! }));
+    if (objs.length) await s3.send(new DeleteObjectsCommand({ Bucket, Delete: { Objects: objs } }));
+    token = l.NextContinuationToken;
+  } while (token);
+  const check = await s3.send(new ListObjectsV2Command({ Bucket, Prefix, MaxKeys: 1 }));
+  if ((check.KeyCount ?? 0) > 0) throw new Error('deletion_not_verified');
+}
+// apps/api/src/identity.ts
+import { cfg } from './config.js';
+import type { FaceBox } from './analyze.js';
+
+const post = async <T>(path: string, body: unknown): Promise<T> => {
+  const r = await fetch(`${cfg.IDENTITY_URL}${path}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body), signal: AbortSignal.timeout(20_000),
+  });
+  if (!r.ok) throw new Error(`identity_service_${r.status}`);
+  return r.json() as Promise<T>;
+};
+
+export const identity = {
+  available: () => !!cfg.IDENTITY_URL,
+
+  async detect(img: Buffer): Promise<{ available: boolean; faces: FaceBox[] }> {
+    if (!cfg.IDENTITY_URL) return { available: false, faces: [] };
+    try {
+      const r = await post<{ faces: FaceBox[] }>('/detect', { image: img.toString('base64') });
+      return { available: true, faces: r.faces };
+    } catch { return { available: false, faces: [] }; }
+  },
+
+  /** Cosine similarity of face embeddings. Returns null when it can't be measured. */
+  async similarity(a: Buffer, b: Buffer): Promise<number | null> {
+    if (!cfg.IDENTITY_URL) return null;
+    try {
+      const r = await post<{ similarity: number | null }>('/compare', {
+        a: a.toString('base64'), b: b.toString('base64'),
+      });
+      return r.similarity;
+    } catch { return null; }
+  },
+};
+# services/identity/app.py   (pip install fastapi uvicorn insightface onnxruntime opencv-python-headless numpy)
+import base64, cv2, numpy as np
+from fastapi import FastAPI
+from pydantic import BaseModel
+from insightface.app import FaceAnalysis
+
+# LICENSING: InsightFace's pretrained packs are non-commercial research only.
+# For a commercial product, license them or swap in an embedding model you may use commercially.
+fa = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+fa.prepare(ctx_id=-1, det_size=(640, 640))
+app = FastAPI()
+
+def dec(b64: str):
+    return cv2.imdecode(np.frombuffer(base64.b64decode(b64), np.uint8), cv2.IMREAD_COLOR)
+
+class One(BaseModel): image: str
+class Two(BaseModel): a: str; b: str
+
+@app.post("/detect")
+def detect(r: One):
+    img = dec(r.image)
+    faces = fa.get(img)
+    return {"faces": [
+        {"x": int(f.bbox[0]), "y": int(f.bbox[1]),
+         "w": int(f.bbox[2] - f.bbox[0]), "h": int(f.bbox[3] - f.bbox[1]),
+         "score": float(f.det_score)} for f in faces if f.det_score > 0.5]}
+
+@app.post("/compare")
+def compare(r: Two):
+    fa_, fb_ = fa.get(dec(r.a)), fa.get(dec(r.b))
+    if not fa_ or not fb_:
+        return {"similarity": None}          # unmeasurable, so the caller must treat it as a fail
+    a = max(fa_, key=lambda f: f.det_score).normed_embedding
+    b = max(fb_, key=lambda f: f.det_score).normed_embedding
+    return {"similarity": float(np.dot(a, b))}
+// apps/api/src/providers/replicate.ts
+import Replicate from 'replicate';
+import { cfg } from '../config.js';
+import { db } from '../db.js';
+
+export type ModelKey = 'esrgan' | 'swinir' | 'gfpgan' | 'codeformer' | 'nafnet' | 'oldphoto';
+
+export class TransientError extends Error {}
+export class PermanentError extends Error { constructor(m: string, public code = 'provider_error') { super(m); } }
+
+const replicate = new Replicate({ auth: cfg.REPLICATE_API_TOKEN });
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * UNVERIFIED parameter names. They come from memory, because I could not read the
+ * schemas without an API token. Confirm each against the pinned version's schema.
+ */
+export const inputFor = {
+  esrgan:     (image: string, scale: number) => ({ image, scale, face_enhance: false }),
+  swinir:     (image: string, task: 'jpeg' | 'denoise', n: number) =>
+    task === 'jpeg'
+      ? { image, task_type: 'JPEG Compression Artifact Reduction', jpeg: n }
+      : { image, task_type: 'Color Image Denoising', noise: n },
+  codeformer: (image: string, fidelity: number) =>
+    ({ image, codeformer_fidelity: fidelity, background_enhance: false, face_upsample: false, upscale: 1 }),
+  gfpgan:     (img: string) => ({ img, version: 'v1.4', scale: 1 }),
+  nafnet:     (image: string) => ({ image, task_type: 'Image Debluring (GoPro)' }),
+  oldphoto:   (image: string) => ({ image, HR: false, with_scratch: true }),
+};
+
+export async function runModel(
+  model: ModelKey, input: Record<string, unknown>, jobId: string, timeoutMs = 180_000,
+): Promise<Buffer> {
+  const version = cfg.REPLICATE_VERSIONS[model];
+  if (!version) throw new PermanentError(`No pinned version for ${model}`, 'not_configured');
+  for (let attempt = 0; ; attempt++) {
+    try { return await once(model, version, input, jobId, timeoutMs); }
+    catch (e) {
+      if (e instanceof TransientError && attempt < 2) {
+        await sleep(2000 * 2 ** attempt + Math.random() * 500);
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
+async function once(model: ModelKey, version: string, input: Record<string, unknown>, jobId: string, timeoutMs: number) {
+  let pred;
+  try { pred = await replicate.predictions.create({ version, input }); }
+  catch (e: any) {
+    const st = e?.response?.status;
+    if (st === 429 || st >= 500) throw new TransientError(`create_${st}`);
+    throw new PermanentError(`create_failed_${st ?? 'unknown'}`);
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (!['succeeded', 'failed', 'canceled'].includes(pred.status)) {
+    if (Date.now() > deadline) {
+      await replicate.predictions.cancel(pred.id).catch(() => {});
+      throw new TransientError('model_timeout');
+    }
+    await sleep(1500);
+    try { pred = await replicate.predictions.get(pred.id); } catch { /* transient poll error, keep trying until the deadline */ }
+  }
+  const seconds = (pred.metrics as any)?.predict_time as number | undefined;
+  const cost = seconds ? seconds * (cfg.PRICE_PER_SECOND[model] ?? 0) : null;
+  await db.query('insert into provider_calls(job_id,model,seconds,est_cost_usd,ok) values($1,$2,$3,$4,$5)',
+    [jobId, model, seconds ?? null, cost, pred.status === 'succeeded']);
+
+  if (pred.status !== 'succeeded') {
+    const msg = String(pred.error ?? '');
+    if (/out of memory|oom|too large|exceeds/i.test(msg)) throw new PermanentError(msg, 'image_too_large');
+    throw new TransientError(msg || pred.status);
+  }
+  const url = Array.isArray(pred.output) ? pred.output[0] : pred.output;
+  if (typeof url !== 'string') throw new PermanentError('unexpected_output_shape');
+  const r = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+  if (!r.ok) throw new TransientError(`output_fetch_${r.status}`);
+  if (Number(r.headers.get('content-length') ?? 0) > 250 * 1024 * 1024) throw new PermanentError('output_too_large');
+  return Buffer.from(await r.arrayBuffer());   // re-stored by us. Provider URLs never reach the client.
+}
+// apps/api/src/qc.ts
+import sharp from 'sharp';
+import { lapVar, type FaceBox } from './analyze.js';
+import { MODES, type ModeId } from './modes.js';
+
+export interface Check { name: string; pass: boolean; value?: number | string; limit?: string }
+export interface QcResult { pass: boolean; checks: Check[] }
+
+const gray = async (buf: Buffer, w: number, h: number) =>
+  (await sharp(buf).resize(w, h, { fit: 'fill' }).greyscale().raw().toBuffer());
+
+async function centerCrop(buf: Buffer, W: number, H: number, size = 1024) {
+  const w = Math.min(size, W), h = Math.min(size, H);
+  const { data } = await sharp(buf)
+    .extract({ left: Math.floor((W - w) / 2), top: Math.floor((H - h) / 2), width: w, height: h })
+    .greyscale().raw().toBuffer({ resolveWithObject: true });
+  return { data, w, h };
+}
+
+/**
+ * `baseline` is the original resized with Lanczos to the target size. It is the
+ * "what you'd get without AI" reference every metric is measured against.
+ * Thresholds are starting heuristics. Calibrate them on your own test set.
+ */
+export async function runQc(p: {
+  output: Buffer; baseline: Buffer; expected: { w: number; h: number };
+  originalAspect: number; mode: ModeId; faces: FaceBox[];
+  identityResults: { similarity: number | null; accepted: boolean }[];
+}): Promise<QcResult> {
+  const spec = MODES[p.mode];
+  const checks: Check[] = [];
+  const add = (c: Check) => checks.push(c);
+
+  // 1. file integrity: a full decode must succeed
+  let W = 0, H = 0;
+  try {
+    const meta = await sharp(p.output).metadata();
+    await sharp(p.output).stats();
+    W = meta.width ?? 0; H = meta.height ?? 0;
+    add({ name: 'integrity', pass: W > 0 && H > 0 && ['png', 'jpeg'].includes(meta.format ?? '') });
+  } catch { add({ name: 'integrity', pass: false }); return { pass: false, checks }; }
+
+  // 2. exact dimensions, 3. aspect ratio
+  add({ name: 'dimensions', pass: W === p.expected.w && H === p.expected.h, value: `${W}x${H}`, limit: `${p.expected.w}x${p.expected.h}` });
+  const aspectErr = Math.abs(W / H - p.originalAspect) / p.originalAspect;
+  add({ name: 'aspect_ratio', pass: aspectErr < 0.005 || Math.abs(W - Math.round(H * p.originalAspect)) <= 1, value: aspectErr.toFixed(5) });
+
+  // 4. missing or blank sections: 8x8 grid on a 64x64 proxy
+  const [go, gb] = await Promise.all([gray(p.output, 64, 64), gray(p.baseline, 64, 64)]);
+  let worst = 0, blank = 0;
+  for (let by = 0; by < 8; by++) for (let bx = 0; bx < 8; bx++) {
+    let d = 0, mo = 0, mb = 0, so = 0, sb = 0;
+    for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
+      const i = (by * 8 + y) * 64 + bx * 8 + x;
+      d += Math.abs(go[i] - gb[i]); mo += go[i]; mb += gb[i];
+    }
+    mo /= 64; mb /= 64;
+    for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
+      const i = (by * 8 + y) * 64 + bx * 8 + x;
+      so += (go[i] - mo) ** 2; sb += (gb[i] - mb) ** 2;
+    }
+    worst = Math.max(worst, d / 64);
+    if (Math.sqrt(so / 64) < 1 && Math.sqrt(sb / 64) > 10) blank++;
+  }
+  add({ name: 'missing_regions', pass: worst < 60 && blank === 0, value: `maxBlockDiff=${worst.toFixed(1)}, blank=${blank}` });
+
+  // 5. colour consistency: mean RGB on a tiny proxy
+  const mean = async (b: Buffer) => (await sharp(b).resize(32, 32, { fit: 'fill' }).removeAlpha().stats()).channels.map((c) => c.mean);
+  const [mo, mb] = await Promise.all([mean(p.output), mean(p.baseline)]);
+  const dRGB = Math.max(...mo.map((v, i) => Math.abs(v - mb[i])));
+  add({ name: 'color_consistency', pass: dRGB <= spec.colorTolerance, value: dRGB.toFixed(1), limit: `<=${spec.colorTolerance}` });
+
+  // 6. sharpness and over-sharpening: native-resolution centre crop
+  const [co, cb] = await Promise.all([centerCrop(p.output, W, H), centerCrop(p.baseline, W, H)]);
+  const ratio = lapVar(co.data, co.w, co.h) / Math.max(lapVar(cb.data, cb.w, cb.h), 1e-6);
+  add({ name: 'sharpness', pass: ratio >= spec.minSharpnessRatio && ratio <= spec.maxSharpnessRatio, value: ratio.toFixed(2), limit: `${spec.minSharpnessRatio}-${spec.maxSharpnessRatio}` });
+
+  // 7. clipping: new blown-out or crushed pixels (artifact proxy)
+  const clip = (g: Buffer) => { let c = 0; for (const v of g) if (v < 2 || v > 253) c++; return c / g.length; };
+  const clipDelta = clip(go) - clip(gb);
+  add({ name: 'clipping', pass: clipDelta < 0.03, value: clipDelta.toFixed(3) });
+
+  // 8. plastic skin: face texture must not collapse relative to the baseline
+  if (p.faces.length && p.mode !== 'noise_cleaner') {
+    const f = [...p.faces].sort((a, b) => b.w * b.h - a.w * a.h)[0];
+    const box = { left: Math.max(0, Math.round(f.x)), top: Math.max(0, Math.round(f.y)),
+      width: Math.min(Math.round(f.w), W - Math.round(f.x)), height: Math.min(Math.round(f.h), H - Math.round(f.y)) };
+    if (box.width > 24 && box.height > 24) {
+      const crop = async (b: Buffer) => sharp(b).extract(box).greyscale().raw().toBuffer({ resolveWithObject: true });
+      const [a, c] = await Promise.all([crop(p.output), crop(p.baseline)]);
+      const r = lapVar(a.data, a.info.width, a.info.height) / Math.max(lapVar(c.data, c.info.width, c.info.height), 1e-6);
+      add({ name: 'skin_texture', pass: r >= 0.6, value: r.toFixed(2), limit: '>=0.6' });
+    }
+  }
+
+  // 9. identity: every attempted face restoration must have been accepted or rejected explicitly
+  const unmeasured = p.identityResults.filter((r) => r.accepted && r.similarity === null).length;
+  add({ name: 'identity_checked', pass: unmeasured === 0, value: `${p.identityResults.length} face(s), ${unmeasured} unmeasured accepted` });
+
+  return { pass: checks.every((c) => c.pass), checks };
+}
+// apps/api/src/pipeline.ts
+import sharp from 'sharp';
+import { createHash } from 'node:crypto';
+import { cfg } from './config.js';
+import { db, setJob } from './db.js';
+import { analyze, toWorkPng, type Analysis, type FaceBox } from './analyze.js';
+import { buildPlan, saferPlan, type Plan, type Step } from './router.js';
+import { runModel, inputFor, PermanentError, TransientError } from './providers/replicate.js';
+import { getBuffer, putBuffer, presignGet, keys, deletePrefix } from './store.js';
+import { identity } from './identity.js';
+import { runQc } from './qc.js';
+import { MODES } from './modes.js';
+import { refund } from './quota.js';
+
+const sha256 = (b: Buffer) => createHash('sha256').update(b).digest('hex');
+
+export async function processJob(jobId: string): Promise<void> {
+  const job = await db.one('select j.*, u.plan from jobs j join users u on u.id=j.user_id where j.id=$1', [jobId]);
+  if (!job || job.status !== 'queued') return;                  // duplicate-delivery guard
+  const tier = job.plan as 'free' | 'premium';
+  try {
+    await setJob(jobId, { status: 'analyzing', progress: 5 });
+    const original = await getBuffer(job.original_key);
+    const work = await toWorkPng(original);
+    const a = await analyze(work, original.length);
+
+    const first = buildPlan(job.mode, a, { tier, faceRestore: job.face_restore });
+    const ladder: Plan[] = [first, saferPlan(first, 1, a, tier), saferPlan(first, 2, a, tier)];
+    const diagnostics: unknown[] = [];
+
+    for (let i = 0; i < ladder.length; i++) {
+      const plan = ladder[i];
+      await setJob(jobId, { attempts: i + 1, plan, progress: 10 });
+      try {
+        const r = await render(job, work, a, plan);
+        const qc = await runQc({
+          output: r.image, baseline: r.baseline, expected: plan.target,
+          originalAspect: a.width / a.height, mode: job.mode, faces: r.faces, identityResults: r.identity,
+        });
+        diagnostics.push({ attempt: i + 1, qc });
+        if (!qc.pass) continue;                               // retry with a safer configuration
+
+        await setJob(jobId, { status: 'checking', progress: 94 });
+        const out = await encode(r.image, job.export_format);
+        const ext = job.export_format === 'png' ? 'png' : 'jpg';
+        const key = keys.output(job.user_id, jobId, ext);
+        await putBuffer(key, out, job.export_format === 'png' ? 'image/png' : 'image/jpeg');
+
+        // verify the stored object, not our in-memory copy
+        const stored = await getBuffer(key);
+        const meta = await sharp(stored).metadata();
+        if (sha256(stored) !== sha256(out) || meta.width !== plan.target.w || meta.height !== plan.target.h)
+          throw new TransientError('stored_output_mismatch');
+
+        const longEdge = Math.max(meta.width!, meta.height!);
+        const label = job.mode === 'upscale_4k' && longEdge >= 3840 ? '4K' : null;   // computed from real pixels
+        await setJob(jobId, {
+          status: 'succeeded', progress: 100, output_key: key, output_bytes: stored.length,
+          output_w: meta.width, output_h: meta.height, output_sha256: sha256(stored),
+          output_label: label, qc: diagnostics,
+        });
+        await deletePrefix(`${keys.prefix(job.user_id, jobId)}work/`);        // intermediates are gone right away
+        return;
+      } catch (e) {
+        if (e instanceof PermanentError && e.code === 'not_configured') throw e;
+        diagnostics.push({ attempt: i + 1, error: String((e as Error).message) });
+        if (i === ladder.length - 1) throw e;
+      }
+    }
+    throw new PermanentError('qc_failed', 'quality_check_failed');
+  } catch (e) {
+    await fail(job, e);
+  }
+}
+
+async function render(job: any, work: Buffer, a: Analysis, plan: Plan) {
+  const base = await sharp(work).resize(plan.target.w, plan.target.h, { kernel: 'lanczos3' }).png().toBuffer();
+
+  // ---- AI steps on an input capped to MAX_AI_INPUT_EDGE
+  let cur = work;
+  const sr = plan.steps.length > 0;
+  if (sr) {
+    const meta = await sharp(work).metadata();
+    if (Math.max(meta.width!, meta.height!) > cfg.MAX_AI_INPUT_EDGE) {
+      cur = await sharp(work).resize({ width: cfg.MAX_AI_INPUT_EDGE, height: cfg.MAX_AI_INPUT_EDGE, fit: 'inside' }).png().toBuffer();
+    }
+  }
+  let n = 0;
+  for (const step of plan.steps) {
+    n++;
+    await setJob(job.id, { status: 'enhancing', progress: 10 + Math.round((n / plan.steps.length) * 55) });
+    cur = await runStep(job, step, cur, `s${n}`);
+  }
+  let enhanced = await sharp(cur).resize(plan.target.w, plan.target.h, { kernel: 'lanczos3' }).toColourspace('srgb').png().toBuffer();
+
+  // ---- non-generative local ops
+  let pipe = sharp(enhanced);
+  if (plan.localOps.autoLevels) pipe = pipe.normalise({ lower: 1, upper: 99 });
+  if (plan.localOps.gamma) pipe = pipe.gamma(plan.localOps.gamma);
+  if (plan.localOps.sharpen) pipe = pipe.sharpen({ sigma: 0.8, m1: plan.localOps.sharpen, m2: 1 });
+  enhanced = await pipe.png().toBuffer();
+
+  // ---- intensity: real blend between the plain-resize baseline and the enhanced result
+  const k = job.intensity / 100;
+  let image = k >= 0.999 ? enhanced : await sharp(base)
+    .composite([{ input: await sharp(enhanced).ensureAlpha(k).png().toBuffer(), blend: 'over' }]).png().toBuffer();
+
+  // ---- faces
+  let faces: FaceBox[] = [];
+  let idResults: { similarity: number | null; accepted: boolean }[] = [];
+  if (plan.faces !== 'off' && job.face_restore) {
+    await setJob(job.id, { status: 'face_restoring', progress: 75 });
+    const r = await restoreFaces(job, image, plan, job.face_strength / 100);
+    image = r.image; faces = r.faces; idResults = r.results;
+  }
+  return { image, baseline: base, faces, identity: idResults };
+}
+
+async function runStep(job: any, step: Step, input: Buffer, name: string): Promise<Buffer> {
+  const key = keys.work(job.user_id, job.id, name);
+  await putBuffer(key, input, 'image/png');
+  const url = await presignGet(key, 600);                  // short-lived URL for the provider only
+  switch (step.kind) {
+    case 'sr':       return runModel('esrgan', inputFor.esrgan(url, step.scale), job.id);
+    case 'jpeg':     return runModel('swinir', inputFor.swinir(url, 'jpeg', step.quality), job.id);
+    case 'denoise':  return runModel('swinir', inputFor.swinir(url, 'denoise', step.level), job.id);
+    case 'deblur':   return runModel('nafnet', inputFor.nafnet(url), job.id);
+    case 'oldphoto': return runModel('oldphoto', inputFor.oldphoto(url), job.id);
+  }
+}
+
+/** Identity thresholds are starting values. Calibrate them with your own consented test set. */
+const SIM_ACCEPT = 0.85, SIM_PARTIAL = 0.70;
+
+async function restoreFaces(job: any, img: Buffer, plan: Plan, strength: number) {
+  const meta = await sharp(img).metadata();
+  const W = meta.width!, H = meta.height!;
+  const results: { similarity: number | null; accepted: boolean }[] = [];
+  let out = img;
+
+  let boxes: FaceBox[];
+  if (plan.faces === 'whole-image-fallback') boxes = [{ x: 0, y: 0, w: W, h: H, score: 1 }];
+  else boxes = (await identity.detect(img)).faces.filter((f) => f.w >= 48 && f.h >= 48)
+    .sort((a, b) => b.w * b.h - a.w * a.h).slice(0, 6);
+
+  for (const [i, f] of boxes.entries()) {
+    const m = plan.faces === 'whole-image-fallback' ? 0 : Math.round(Math.max(f.w, f.h) * 0.4);
+    const left = Math.max(0, Math.round(f.x) - m), top = Math.max(0, Math.round(f.y) - m);
+    const width = Math.min(W - left, Math.round(f.w) + 2 * m), height = Math.min(H - top, Math.round(f.h) + 2 * m);
+    const crop = await sharp(out).extract({ left, top, width, height }).png().toBuffer();
+
+    let restored: Buffer;
+    try { restored = await runStep(job, { kind: 'sr', scale: 2 } as Step, crop, `f${i}`).then(() => crop); }
+    catch { restored = crop; }
+    // run the actual face model on the crop (CodeFormer, conservative fidelity)
+    try {
+      const key = keys.work(job.user_id, job.id, `face${i}`);
+      await putBuffer(key, crop, 'image/png');
+      restored = await runModel('codeformer', inputFor.codeformer(await presignGet(key, 600), plan.faceFidelity), job.id);
+      restored = await sharp(restored).resize(width, height, { fit: 'fill', kernel: 'lanczos3' }).png().toBuffer();
+    } catch { results.push({ similarity: null, accepted: false }); continue; }
+
+    let alpha: number, sim: number | null = null;
+    if (plan.faces === 'whole-image-fallback') { alpha = 0.6; }
+    else {
+      sim = await identity.similarity(crop, restored);
+      alpha = sim === null ? 0 : sim >= SIM_ACCEPT ? 1 : sim >= SIM_PARTIAL ? 0.5 : 0;
+    }
+    alpha *= strength;
+    results.push({ similarity: sim, accepted: alpha > 0 });
+    if (alpha <= 0) continue;                              // identity not confidently preserved, so we keep the original face
+
+    // feathered elliptical mask, so only the face blends in
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
+      <defs><filter id="b"><feGaussianBlur stdDeviation="${Math.max(2, Math.round(Math.min(width, height) * 0.04))}"/></filter></defs>
+      <rect width="100%" height="100%" fill="black"/>
+      <ellipse cx="${width / 2}" cy="${height / 2}" rx="${width * 0.36}" ry="${height * 0.42}" fill="white" fill-opacity="${alpha}" filter="url(#b)"/></svg>`;
+    const mask = await sharp(Buffer.from(svg)).greyscale().raw().toBuffer({ resolveWithObject: true });
+    const patch = await sharp(restored).removeAlpha()
+      .joinChannel(mask.data, { raw: { width: mask.info.width, height: mask.info.height, channels: 1 } })
+      .png().toBuffer();
+    out = await sharp(out).composite([{ input: patch, left, top, blend: 'over' }]).png().toBuffer();
+  }
+  return { image: out, faces: boxes, results };
+}
+
+const encode = (img: Buffer, fmt: 'png' | 'jpeg') =>
+  fmt === 'png'
+    ? sharp(img).png({ compressionLevel: 6 }).toBuffer()
+    : sharp(img).jpeg({ quality: 95, chromaSubsampling: '4:4:4', mozjpeg: true }).toBuffer();
+
+const MESSAGES: Record<string, string> = {
+  quality_check_failed: "We couldn't enhance this photo without visible problems, so we didn't produce a result. Your credit was returned.",
+  image_too_large: 'This photo is too large for AI processing. Try a smaller version.',
+  not_configured: 'Enhancement is temporarily unavailable. Your credit was returned.',
+  provider_error: 'The enhancement service had a problem. Your credit was returned. Please try again.',
+};
+
+async function fail(job: any, e: unknown) {
+  const code = e instanceof PermanentError ? e.code : e instanceof TransientError ? 'provider_error' : 'internal_error';
+  await setJob(job.id, { status: 'failed', progress: 100, error_code: code, error_message: MESSAGES[code] ?? MESSAGES.provider_error });
+  await refund(job.id);
+  await deletePrefix(`${keys.prefix(job.user_id, job.id)}work/`).catch(() => {});
+}
+    let restored: Buffer;
+    try { restored = await runStep(job, { kind: 'sr', scale: 2 } as Step, crop, `f${i}`).then(() => crop); }
+    catch { restored = crop; }
+// apps/api/src/quota.ts
+import { cfg } from './config.js';
+import { db } from './db.js';
+
+export const dailyLimit = (plan: string) => plan === 'premium' ? cfg.PREMIUM_DAILY_CREDITS : cfg.FREE_DAILY_CREDITS;
+
+/** Atomic: succeeds only if the user stays within the limit, so there are no race conditions. */
+export async function reserve(client: any, userId: string, plan: string, cost: number): Promise<boolean> {
+  const r = await client.query(
+    `insert into usage_daily(user_id, day, used) values ($1, (now() at time zone 'utc')::date, $2)
+     on conflict (user_id, day) do update set used = usage_daily.used + $2
+       where usage_daily.used + $2 <= $3
+     returning used`, [userId, cost, dailyLimit(plan)]);
+  return r.rowCount === 1;
+}
+
+export async function refund(jobId: string) {
+  await db.query(
+    `with j as (update jobs set credits_charged = 0 where id=$1 and credits_charged > 0
+                returning user_id, credits_charged, created_at)
+     update usage_daily u set used = greatest(u.used - (select credits_charged from jobs where id=$1), 0)
+     from j where u.user_id = j.user_id and u.day = (j.created_at at time zone 'utc')::date`, [jobId]);
+}
+with j as (
+  update jobs j2 set credits_charged = 0
+  from (select id, credits_charged as amt from jobs where id=$1 and credits_charged>0 for update) old
+  where j2.id = old.id
+  returning j2.user_id, j2.created_at, old.amt
+)
+update usage_daily u set used = greatest(u.used - j.amt, 0)
+from j where u.user_id=j.user_id and u.day=(j.created_at at time zone 'utc')::date
+// apps/api/src/queue.ts
+import { Queue, Worker } from 'bullmq';
+import { cfg } from './config.js';
+import { processJob } from './pipeline.js';
+
+const connection = { url: cfg.REDIS_URL } as any;
+export const queue = new Queue('enhance', { connection });
+
+export const enqueue = (jobId: string, premium: boolean) =>
+  queue.add('enhance', { jobId }, {
+    jobId,                                   // BullMQ ignores duplicate ids, so a second enqueue is harmless
+    priority: premium ? 1 : 10,              // lower number = served first (faster premium queue)
+    attempts: 1, removeOnComplete: 1000, removeOnFail: 1000,
+  });
+
+export const startWorker = () =>
+  new Worker('enhance', async (j) => {
+    await Promise.race([
+      processJob(j.data.jobId),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('job_timeout')), 8 * 60_000)),
+    ]);
+  }, { connection, concurrency: cfg.WORKER_CONCURRENCY });
+// apps/api/src/retention.ts
+import { db, setJob } from './db.js';
+import { deletePrefix, keys } from './store.js';
+import { refund } from './quota.js';
+
+export async function deleteJobData(job: { id: string; user_id: string }) {
+  await deletePrefix(keys.prefix(job.user_id, job.id));         // throws if anything remains
+  await db.query(
+    `update jobs set status='deleted', original_key=null, output_key=null, plan=null, qc=null,
+       original_sha256=null, output_sha256=null where id=$1`, [job.id]);
+}
+
+export function startSweepers() {
+  setInterval(async () => {
+    const due = await db.many(`select id,user_id from jobs where expires_at < now() and status <> 'deleted' limit 200`);
+    for (const j of due) await deleteJobData(j).catch((e) => console.error('retention_failed', j.id, e.message));
+  }, 10 * 60_000);
+
+  // watchdog: no job may sit in a non-terminal state forever
+  setInterval(async () => {
+    const stuck = await db.many(
+      `select id from jobs where status in ('queued','analyzing','enhancing','face_restoring','checking')
+         and updated_at < now() - interval '15 minutes'`);
+    for (const j of stuck) {
+      await setJob(j.id, { status: 'failed', progress: 100, error_code: 'timeout',
+        error_message: 'This took too long and was stopped. Your credit was returned. Please try again.' });
+      await refund(j.id);
+    }
+  }, 60_000);
+}
+// apps/api/src/routes.ts
+import type { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { createHash } from 'node:crypto';
+import sharp from 'sharp';
+import { cfg } from './config.js';
+import { db, pool, setJob } from './db.js';
+import { MODES } from './modes.js';
+import { reserve, dailyLimit } from './quota.js';
+import { enqueue } from './queue.js';
+import { presignUpload, presignGet, getBuffer, headSize, keys } from './store.js';
+import { deleteJobData } from './retention.js';
+
+const JWKS = createRemoteJWKSet(new URL(cfg.AUTH_JWKS_URL));
+const POLICY_VERSION = '2026-11-01';
+
+const CreateJob = z.object({
+  mode: z.enum(Object.keys(MODES) as [keyof typeof MODES, ...(keyof typeof MODES)[]]),
+  intensity: z.number().int().min(0).max(100).optional(),
+  faceRestore: z.boolean().default(true),
+  faceStrength: z.number().int().min(0).max(100).default(100),
+  exportFormat: z.enum(['png', 'jpeg']).default('jpeg'),
+  contentType: z.enum(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif']),
+  consent: z.object({ processing: z.literal(true), training: z.boolean().default(false) }),
+});
+
+export async function routes(app: FastifyInstance) {
+  app.decorateRequest('user', null as any);
+  app.addHook('preHandler', async (req, reply) => {
+    if (req.url === '/health' || req.url.startsWith('/webhooks/')) return;
+    try {
+      const token = (req.headers.authorization ?? '').replace(/^Bearer /, '');
+      const { payload } = await jwtVerify(token, JWKS, { issuer: cfg.AUTH_ISSUER });
+      const u = await db.one(
+        `insert into users(id) values($1) on conflict (id) do update set id=excluded.id returning *`, [payload.sub]);
+      (req as any).user = u;
+    } catch { return reply.code(401).send({ code: 'unauthorized' }); }
+  });
+
+  app.get('/health', async () => ({ ok: true }));
+
+  app.get('/v1/me', async (req: any) => {
+    const used = (await db.one(`select coalesce(sum(used),0)::int as used from usage_daily where user_id=$1 and day=(now() at time zone 'utc')::date`, [req.user.id])).used;
+    return { plan: req.user.plan, creditsUsedToday: used, dailyLimit: dailyLimit(req.user.plan), retentionHours: cfg.RETENTION_HOURS, policyVersion: POLICY_VERSION };
+  });
+
+  app.post('/v1/jobs', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (req: any, reply) => {
+    const idem = String(req.headers['idempotency-key'] ?? '');
+    if (idem.length < 8) return reply.code(400).send({ code: 'idempotency_key_required' });
+    const body = CreateJob.safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ code: 'invalid_request', issues: body.error.issues });
+    const b = body.data, user = req.user, spec = MODES[b.mode];
+
+    const dup = await db.oneOrNone('select * from jobs where user_id=$1 and idempotency_key=$2', [user.id, idem]);
+    if (dup) return reply.code(200).send(publicJob(dup));                       // duplicate-request protection
+
+    if (spec.tier === 'premium' && user.plan !== 'premium')
+      return reply.code(402).send({ code: 'premium_required', message: `${spec.label} is a Premium mode.` });
+
+    const active = await db.one(`select count(*)::int c from jobs where user_id=$1 and status in ('queued','analyzing','enhancing','face_restoring','checking')`, [user.id]);
+    if (active.c >= 2) return reply.code(429).send({ code: 'too_many_active', message: 'Two photos are already processing. Please wait for one to finish.' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('begin');
+      if (!(await reserve(client, user.id, user.plan, spec.credits))) {
+        await client.query('rollback');
+        return reply.code(429).send({ code: 'daily_limit', message: 'Daily credit limit reached. It resets at 00:00 UTC.' });
+      }
+      await client.query(`insert into consents(user_id,kind,policy_version,granted) values ($1,'upload_processing',$2,true),($1,'training',$2,$3)`,
+        [user.id, POLICY_VERSION, b.consent.training]);
+      const row = (await client.query(
+        `insert into jobs(user_id,idempotency_key,mode,intensity,face_restore,face_strength,export_format,status,credits_charged,expires_at)
+         values($1,$2,$3,$4,$5,$6,$7,'awaiting_upload',$8, now() + ($9 || ' hours')::interval) returning *`,
+        [user.id, idem, b.mode, b.intensity ?? spec.defaultIntensity, b.faceRestore, b.faceStrength, b.exportFormat, spec.credits, String(cfg.RETENTION_HOURS)])).rows[0];
+      await client.query('commit');
+      const key = keys.original(user.id, row.id);
+      const post = await presignUpload(key, cfg.MAX_UPLOAD_BYTES, b.contentType);
+      await db.query('update jobs set original_key=$2 where id=$1', [row.id, key]);
+      return { job: publicJob(row), upload: post };
+    } catch (e) { await client.query('rollback').catch(() => {}); throw e; }
+    finally { client.release(); }
+  });
+
+  app.post('/v1/jobs/:id/start', async (req: any, reply) => {
+    const job = await ownJob(req, reply); if (!job) return;
+    if (job.status !== 'awaiting_upload') return publicJob(job);                 // idempotent
+    const size = await headSize(job.original_key);
+    if (!size) return reply.code(409).send({ code: 'upload_missing', message: 'We did not receive your photo. Please upload it again.' });
+    if (size > cfg.MAX_UPLOAD_BYTES) return reply.code(413).send({ code: 'too_big' });
+    const buf = await getBuffer(job.original_key);
+    let w = 0, h = 0;
+    try {
+      const m = await sharp(buf, { limitInputPixels: cfg.MAX_PIXELS }).metadata();       // real decode check, never trusts Content-Type
+      w = m.width ?? 0; h = m.height ?? 0;
+    } catch {
+      // HEIC without a native decoder is handled later by toWorkPng. Anything else is rejected.
+      if (!/ftyp(heic|heix|mif1|hevc)/.test(buf.subarray(4, 12).toString('ascii')))
+        return reply.code(415).send({ code: 'unsupported_image', message: "We couldn't read that file as a photo." });
+    }
+    await setJob(job.id, { status: 'queued', progress: 2, original_bytes: size, original_w: w || null, original_h: h || null,
+      original_sha256: createHash('sha256').update(buf).digest('hex') });
+    await enqueue(job.id, (req.user.plan === 'premium'));
+    return publicJob(await db.one('select * from jobs where id=$1', [job.id]));
+  });
+
+  app.get('/v1/jobs', async (req: any) =>
+    (await db.many(`select * from jobs where user_id=$1 and status<>'deleted' order by created_at desc limit 50`, [req.user.id])).map(publicJob));
+
+  app.get('/v1/jobs/:id', async (req: any, reply) => { const j = await ownJob(req, reply); return j && publicJob(j); });
+
+  app.get('/v1/jobs/:id/files/:variant', async (req: any, reply) => {
+    const j = await ownJob(req, reply); if (!j) return;
+    const variant = req.params.variant;
+    if (variant === 'output' && j.status !== 'succeeded') return reply.code(409).send({ code: 'not_ready' });
+    const key = variant === 'original' ? j.original_key : variant === 'output' ? j.output_key : null;
+    if (!key) return reply.code(404).send({ code: 'gone', message: 'This file has been deleted.' });
+    const ext = variant === 'output' ? (j.export_format === 'png' ? 'png' : 'jpg') : 'orig';
+    return { url: await presignGet(key, 300, `hdglow-${j.id.slice(0, 8)}-${variant}.${ext}`), expiresInSeconds: 300,
+             sha256: variant === 'output' ? j.output_sha256 : j.original_sha256 };
+  });
+
+  app.delete('/v1/jobs/:id', async (req: any, reply) => {
+    const j = await ownJob(req, reply); if (!j) return;
+    await deleteJobData(j);
+    return { deleted: true };
+  });
+
+  app.delete('/v1/me/data', async (req: any) => {
+    const mine = await db.many(`select id,user_id from jobs where user_id=$1 and status<>'deleted'`, [req.user.id]);
+    for (const j of mine) await deleteJobData(j);
+    return { deleted: mine.length };
+  });
+}
+
+async function ownJob(req: any, reply: any) {
+  const j = await db.oneOrNone('select * from jobs where id=$1 and user_id=$2', [req.params.id, req.user.id]);
+  if (!j) { reply.code(404).send({ code: 'not_found' }); return null; }
+  return j;
+}
+
+const publicJob = (j: any) => ({
+  id: j.id, status: j.status, progress: j.progress, mode: j.mode, intensity: j.intensity,
+  faceRestore: j.face_restore, exportFormat: j.export_format,
+  original: j.original_w ? { width: j.original_w, height: j.original_h, bytes: Number(j.original_bytes) } : null,
+  output: j.output_w ? { width: j.output_w, height: j.output_h, bytes: Number(j.output_bytes), label: j.output_label, sha256: j.output_sha256 } : null,
+  explanation: j.plan?.reasons ?? [], error: j.error_code ? { code: j.error_code, message: j.error_message } : null,
+  expiresAt: j.expires_at,
+});
+// apps/api/src/server.ts
+import Fastify from 'fastify';
+import helmet from '@fastify/helmet';
+import cors from '@fastify/cors';
+import rateLimit from '@fastify/rate-limit';
+import { Redis } from 'ioredis';
+import { cfg } from './config.js';
+import { routes } from './routes.js';
+import { startWorker } from './queue.js';
+import { startSweepers } from './retention.js';
+
+const app = Fastify({ logger: { redact: ['req.headers.authorization'] }, bodyLimit: 64 * 1024 });  // images never pass through the API
+await app.register(helmet);
+await app.register(cors, { origin: cfg.WEB_ORIGIN });
+await app.register(rateLimit, { max: 120, timeWindow: '1 minute', redis: new Redis(cfg.REDIS_URL) });
+await app.register(routes);
+if (process.env.ROLE !== 'api-only') { startWorker(); startSweepers(); }
+await app.listen({ port: 8080, host: '0.0.0.0' });
+// apps/web/src/api.ts
+const API = import.meta.env.VITE_API_URL;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+let token = () => localStorage.getItem('token') ?? '';
+
+async function call(path: string, init: RequestInit = {}) {
+  const r = await fetch(API + path, { ...init, headers: { ...(init.headers as any), authorization: `Bearer ${token()}`, 'content-type': 'application/json' } });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(body.message ?? 'Request failed'), body);
+  return body;
+}
+
+export function uploadWithProgress(post: { url: string; fields: Record<string, string> }, file: File, onProgress: (p: number) => void) {
+  return new Promise<void>((resolve, reject) => {
+    const fd = new FormData();
+    Object.entries(post.fields).forEach(([k, v]) => fd.append(k, v));
+    fd.append('file', file);                                   // the file must be the last field
+    const x = new XMLHttpRequest();
+    x.open('POST', post.url);
+    x.timeout = 120_000;
+    x.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded / e.total);
+    x.onload = () => (x.status < 300 ? resolve() : reject(new Error('Upload failed. Please try again.')));
+    x.onerror = x.ontimeout = () => reject(new Error('Upload interrupted. Check your connection and retry.'));
+    x.send(fd);
+  });
+}
+
+/** Call once per click. Reusing `idem` on a retry means a double tap can never double-charge. */
+export async function enhance(file: File, opts: any, idem: string, on: (s: string, p: number) => void) {
+  const { job, upload } = await call('/v1/jobs', {
+    method: 'POST', headers: { 'idempotency-key': idem },
+    body: JSON.stringify({ ...opts, contentType: file.type || 'image/jpeg', consent: { processing: true, training: false } }),
+  });
+  on('uploading', 0);
+  await uploadWithProgress(upload, file, (p) => on('uploading', p * 100));
+  await call(`/v1/jobs/${job.id}/start`, { method: 'POST' });
+
+  const deadline = Date.now() + 10 * 60_000;                   // never an infinite spinner
+  let delay = 1000;
+  while (Date.now() < deadline) {
+    const j = await call(`/v1/jobs/${job.id}`);
+    on(j.status, j.progress);
+    if (j.status === 'succeeded') return j;
+    if (j.status === 'failed') throw Object.assign(new Error(j.error.message), j.error);
+    await sleep(delay); delay = Math.min(delay * 1.3, 4000);
+  }
+  throw new Error('This is taking longer than expected. You can leave this page and check Recent Projects. Your photo is still safe.');
+}
+
+/** Download with retries, then verify the SHA-256 the server recorded before offering the file. */
+export async function downloadVerified(jobId: string, variant: 'output' | 'original') {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const { url, sha256 } = await call(`/v1/jobs/${jobId}/files/${variant}`);   // a fresh signed URL on every attempt
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const blob = await r.blob();
+      const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', await blob.arrayBuffer()))]
+        .map((b) => b.toString(16).padStart(2, '0')).join('');
+      if (sha256 && digest !== sha256) throw new Error('Downloaded file failed its integrity check');
+      return blob;
+    } catch (e) { lastErr = e; await sleep(800 * 2 ** attempt); }
+  }
+  throw new Error(`Download failed after several attempts. ${(lastErr as Error).message}`);
+}
+// apps/web/src/Compare.tsx
+import { useRef, useState, useCallback } from 'react';
+
+/**
+ * Both images share ONE transform, so zoom and pan are identical by construction.
+ * The original is drawn into the same CSS box as the enhanced image, so a 600px original
+ * and a 2400px result line up pixel for pixel in the viewport.
+ */
+export function Compare(props: {
+  originalUrl: string; enhancedUrl: string;
+  originalDims: string; enhancedDims: string; enhancedBytes: string;
+}) {
+  const [split, setSplit] = useState(50);
+  const [view, setView] = useState({ s: 1, x: 0, y: 0 });
+  const root = useRef<HTMLDivElement>(null);
+  const pointers = useRef(new Map<number, { x: number; y: number }>());
+  const last = useRef<{ d: number } | null>(null);
+
+  const zoomAt = useCallback((cx: number, cy: number, factor: number) => {
+    setView((v) => {
+      const s = Math.min(16, Math.max(1, v.s * factor));
+      const k = s / v.s;
+      return s === 1 ? { s: 1, x: 0, y: 0 } : { s, x: cx - (cx - v.x) * k, y: cy - (cy - v.y) * k };
+    });
+  }, []);
+
+  const onWheel = (e: React.WheelEvent) => {
+    const r = root.current!.getBoundingClientRect();
+    zoomAt(e.clientX - r.left, e.clientY - r.top, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+  };
+  const onDown = (e: React.PointerEvent) => { (e.target as Element).setPointerCapture(e.pointerId); pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY }); };
+  const onMove = (e: React.PointerEvent) => {
+    const p = pointers.current.get(e.pointerId); if (!p) return;
+    const prev = { ...p }; p.x = e.clientX; p.y = e.clientY;
+    if (pointers.current.size === 2) {                                  // pinch
+      const [a, b] = [...pointers.current.values()];
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      if (last.current) {
+        const r = root.current!.getBoundingClientRect();
+        zoomAt((a.x + b.x) / 2 - r.left, (a.y + b.y) / 2 - r.top, d / last.current.d);
+      }
+      last.current = { d };
+    } else if (view.s > 1) {                                            // pan
+      setView((v) => ({ ...v, x: v.x + e.clientX - prev.x, y: v.y + e.clientY - prev.y }));
+    }
+  };
+  const onUp = (e: React.PointerEvent) => { pointers.current.delete(e.pointerId); last.current = null; };
+
+  const onHandle = (e: React.PointerEvent) => {
+    e.stopPropagation();
+    const el = root.current!, r = el.getBoundingClientRect();
+    const move = (ev: PointerEvent) => setSplit(Math.min(100, Math.max(0, ((ev.clientX - r.left) / r.width) * 100)));
+    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+    window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+  };
+
+  const stage: React.CSSProperties = { position: 'absolute', inset: 0, transformOrigin: '0 0', transform: `translate(${view.x}px,${view.y}px) scale(${view.s})` };
+  const img: React.CSSProperties = { width: '100%', height: '100%', objectFit: 'contain', userSelect: 'none', pointerEvents: 'none' };
+
+  return (
+    <figure className="compare">
+      <div ref={root} className="compare-frame" onWheel={onWheel} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp}
+           style={{ position: 'relative', overflow: 'hidden', touchAction: 'none', aspectRatio: '4/3', borderRadius: 20, background: '#0b0b0f' }}>
+        <div style={stage}><img src={props.enhancedUrl} alt="Enhanced" style={img} draggable={false} /></div>
+        {/* clip wrapper lives OUTSIDE the transform, so the divider stays vertical while content zooms */}
+        <div style={{ position: 'absolute', inset: 0, clipPath: `inset(0 ${100 - split}% 0 0)` }}>
+          <div style={stage}><img src={props.originalUrl} alt="Original" style={img} draggable={false} /></div>
+        </div>
+        <div role="slider" aria-label="Before and after" aria-valuenow={Math.round(split)} tabIndex={0}
+             onPointerDown={onHandle}
+             onKeyDown={(e) => e.key === 'ArrowLeft' ? setSplit((s) => Math.max(0, s - 2)) : e.key === 'ArrowRight' && setSplit((s) => Math.min(100, s + 2))}
+             style={{ position: 'absolute', top: 0, bottom: 0, left: `${split}%`, width: 44, marginLeft: -22, cursor: 'ew-resize', display: 'grid', placeItems: 'center' }}>
+          <div style={{ width: 2, height: '100%', background: '#fff', boxShadow: '0 0 0 1px #0004' }} />
+          <div style={{ position: 'absolute', width: 36, height: 36, borderRadius: 18, background: '#7c5cff', border: '2px solid #fff' }} />
+        </div>
+        <span className="tag" style={{ position: 'absolute', left: 12, bottom: 12 }}>Original · {props.originalDims}</span>
+        <span className="tag" style={{ position: 'absolute', right: 12, bottom: 12 }}>Enhanced · {props.enhancedDims} · {props.enhancedBytes}</span>
+        {view.s > 1 && <button onClick={() => setView({ s: 1, x: 0, y: 0 })} style={{ position: 'absolute', top: 12, right: 12 }}>Reset zoom</button>}
+      </div>
+    </figure>
+  );
+}
+// tests/qc.test.ts
+import { describe, it, expect } from 'vitest';
+import sharp from 'sharp';
+import { runQc } from '../apps/api/src/qc.js';
+
+async function photoLike(w: number, h: number) {
+  const noise = Buffer.alloc(w * h * 3);
+  for (let i = 0; i < noise.length; i++) noise[i] = 100 + ((i * 2654435761) % 55);
+  return sharp(noise, { raw: { width: w, height: h, channels: 3 } }).blur(1.2).png().toBuffer();
+}
+const base = { faces: [], identityResults: [], mode: 'natural_hd' as const };
+
+describe('quality control', () => {
+  it('passes a faithful output', async () => {
+    const b = await photoLike(800, 600);
+    const r = await runQc({ ...base, output: b, baseline: b, expected: { w: 800, h: 600 }, originalAspect: 4 / 3 });
+    expect(r.pass).toBe(true);
+  });
+  it('fails wrong dimensions', async () => {
+    const b = await photoLike(800, 600);
+    const small = await sharp(b).resize(400, 300).png().toBuffer();
+    const r = await runQc({ ...base, output: small, baseline: b, expected: { w: 800, h: 600 }, originalAspect: 4 / 3 });
+    expect(r.checks.find((c) => c.name === 'dimensions')!.pass).toBe(false);
+  });
+  it('fails a blanked-out region', async () => {
+    const b = await photoLike(800, 600);
+    const hole = await sharp({ create: { width: 300, height: 300, channels: 3, background: '#000' } }).png().toBuffer();
+    const out = await sharp(b).composite([{ input: hole, left: 100, top: 100 }]).png().toBuffer();
+    const r = await runQc({ ...base, output: out, baseline: b, expected: { w: 800, h: 600 }, originalAspect: 4 / 3 });
+    expect(r.pass).toBe(false);
+  });
+  it('fails a corrupted file', async () => {
+    const b = await photoLike(800, 600);
+    const r = await runQc({ ...base, output: b.subarray(0, 200), baseline: b, expected: { w: 800, h: 600 }, originalAspect: 4 / 3 });
+    expect(r.pass).toBe(false);
+  });
+  it('fails an over-sharpened output', async () => {
+    const b = await photoLike(800, 600);
+    const out = await sharp(b).sharpen({ sigma: 3, m1: 20, m2: 20 }).png().toBuffer();
+    const r = await runQc({ ...base, output: out, baseline: b, expected: { w: 800, h: 600 }, originalAspect: 4 / 3 });
+    expect(r.checks.find((c) => c.name === 'sharpness')!.pass).toBe(false);
+  });
+});
+// tests/router.test.ts
+import { describe, it, expect } from 'vitest';
+import { buildPlan } from '../apps/api/src/router.js';
+
+const A = (o: any = {}) => ({ width: 800, height: 600, long: 800, sharpness: 200, noiseSigma: 2, meanLuma: 120,
+  contrastSpan: 220, bytesPerPixel: 1.5, faces: [], faceDetectorAvailable: true, ...o });
+const opts = { tier: 'premium' as const, faceRestore: true };
+
+describe('routing', () => {
+  it('never labels a too-small source as 4K', () => {
+    const p = buildPlan('upscale_4k', A({ long: 500, width: 500, height: 375 }), opts);
+    expect(Math.max(p.target.w, p.target.h)).toBe(2000);
+    expect(p.reasons.join(' ')).toMatch(/too small to reach a true 4K/);
+  });
+  it('reaches exactly 3840 when the source allows it', () => {
+    const p = buildPlan('upscale_4k', A({ long: 1600, width: 1600, height: 1200 }), opts);
+    expect(p.target).toEqual({ w: 3840, h: 2880 });
+  });
+  it('skips noise and JPEG models on a clean image', () => {
+    const p = buildPlan('natural_hd', A(), opts);
+    expect(p.steps.map((s) => s.kind)).toEqual(['sr']);
+  });
+  it('skips face restoration when no face is found, and when the toggle is off', () => {
+    expect(buildPlan('face_restore', A(), opts).faces).toBe('off');
+    expect(buildPlan('face_restore', A({ faces: [{ x: 1, y: 1, w: 90, h: 90, score: 1 }] }), { ...opts, faceRestore: false }).faces).toBe('off');
+  });
+  it('does not upscale already-large photos', () => {
+    const p = buildPlan('ultra_hd', A({ long: 4000, width: 4000, height: 3000 }), opts);
+    expect(p.steps).toEqual([]);
+    expect(p.target).toEqual({ w: 4000, h: 3000 });
+  });
+  it('caps free-tier output edge', () => {
+    const p = buildPlan('natural_hd', A({ long: 1500, width: 1500, height: 1125 }), { tier: 'free', faceRestore: false });
+    expect(Math.max(p.target.w, p.target.h)).toBeLessThanOrEqual(2048);
+  });
+});
+
+
